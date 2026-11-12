@@ -15714,6 +15714,32 @@ function openFirebaseModal() {
         rot = ((rot % 4) + 4) % 4;
         return ['A', 'B', 'C', 'D'][rot];
       }
+      /* Cat vung quanh ma QR tu khung hinh camera roi chay jsQR de lay huong xoay that.
+         jsQR tra location theo huong cua ma (cum tim), khac voi cornerPoints cua
+         BarcodeDetector (theo vi tri trong anh). Tra ve 'A'..'D' hoac null neu doc khong duoc. */
+      function scanLetterFromCrop(video, bb) {
+        var J = window.jsQR;
+        if (!J || !video || !video.videoWidth || !video.videoHeight) return null;
+        var bx = bb.x || 0, by = bb.y || 0, bw = bb.width || 0, bh = bb.height || 0;
+        if (bw < 16 || bh < 16) return null;
+        var pad = Math.max(10, Math.round(Math.min(bw, bh) * 0.2));
+        var x = Math.max(0, Math.floor(bx - pad)), y = Math.max(0, Math.floor(by - pad));
+        var w = Math.min(video.videoWidth - x, Math.ceil(bw + pad * 2));
+        var h = Math.min(video.videoHeight - y, Math.ceil(bh + pad * 2));
+        if (w < 24 || h < 24) return null;
+        var cv = scan.cropCanvas; if (!cv) { cv = document.createElement('canvas'); scan.cropCanvas = cv; }
+        var scale = Math.min(1, 240 / Math.max(w, h));
+        cv.width = Math.max(24, Math.round(w * scale)); cv.height = Math.max(24, Math.round(h * scale));
+        var ctx = cv.getContext('2d');
+        if (!ctx) return null;
+        try {
+          ctx.drawImage(video, x, y, w, h, 0, 0, cv.width, cv.height);
+          var img = ctx.getImageData(0, 0, cv.width, cv.height);
+          var code = J(img.data, img.width, img.height);
+          if (!code || !code.location) return null;
+          return scanLetterFromLocation(code.location);
+        } catch (e) { return null; }
+      }
       function scanDetector() {
         /* May quet ma vach co san cua trinh duyet (Chrome/Edge): bat duoc NHIEU ma trong
            cung mot khung hinh, nhanh va nhay hon jsQR, nhat la khi quet tu xa. Trinh duyet
@@ -15772,12 +15798,12 @@ function openFirebaseModal() {
               (codes || []).forEach(function (c) {
                 var m = /^RCVQR:(\d+)$/.exec(String(c.rawValue || '').trim());
                 if (!m) return;
-                var cp = c.cornerPoints || [];
-                var letter = null;
-                /* Chrome tra cornerPoints theo chieu kim dong ho bat dau tu goc tren-trai
-                   cua chinh ma QR (theo huong cua ma), nen dung thang cong thuc cu. */
-                if (cp.length >= 4) letter = scanLetterFromLocation({ topLeftCorner: cp[0], topRightCorner: cp[1], bottomRightCorner: cp[2], bottomLeftCorner: cp[3] });
                 var bb = c.boundingBox || { x: 0, y: 0, width: 0, height: 0 };
+                /* BarcodeDetector tra cornerPoints theo vi tri trong anh (goc tren-trai
+                   cua khung hinh), KHONG theo huong cua ma QR, nen cong thuc cu luon
+                   ra A. Lay huong xoay that bang jsQR tren vung cat quanh ma. */
+                var letter = scanLetterFromCrop(video, bb);
+                if (!letter) { var _pi = Number(m[1]) - 1; letter = scan.map[_pi] || null; }
                 list.push({ idx: Number(m[1]) - 1, letter: letter, box: { x: bb.x, y: bb.y, w: bb.width, h: bb.height } });
               });
               scanApplyDetections(list);
