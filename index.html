@@ -1752,6 +1752,7 @@ Chấp nhận các biến thể: “Câu 1.” hoặc chỉ “1.” thay cho �
     <div class="scan-actions">
       <button class="btn gold" id="btnScanCamera">📷 Bật camera</button>
       <button class="btn" id="btnScanFlip">🔄 Đổi camera</button>
+      <button class="btn" id="btnScanMirror">🪞 Gương: Tắt</button>
       <button class="btn" id="btnScanClear">🧹 Xóa đáp án câu này</button>
       <button class="btn danger" id="btnScanClose">✕ Đóng máy quét</button>
     </div>
@@ -12543,6 +12544,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 
       /* ================= Luồng chơi ================= */
       function startQuestion(idx, golden) {
+        if (aliveCount() === 0) { gameOver(); return; }
         state.game.current = idx;
         state.game.locked = false;
         state.game.phase = golden ? 'golden' : 'question';
@@ -12643,6 +12645,7 @@ function lockQuestionNow() {
         } else gameOver();
       }
       function gameOver() {
+        stopTimer(); stopTimerTrack();
         state.game.phase = 'over'; state.game.winners = []; save(); renderAll();
         roomPublishEnd();
         sndWrong();
@@ -15654,7 +15657,7 @@ function openFirebaseModal() {
         var prev = $('cardPreview'); if (prev) { prev.innerHTML = html; drawCardQRs(prev); }
       }
       /* Máy quét thẻ QR (mở bằng link #scan=<PIN>&cfg=... trên điện thoại cầm tay) */
-      var scan = { pin: null, stop: null, stream: null, canvas: null, facing: 'environment', running: false, raf: 0, map: {}, current: -1, roster: [], snap: null };
+      var scan = { pin: null, stop: null, stream: null, canvas: null, facing: 'environment', mirror: false, running: false, raf: 0, map: {}, current: -1, roster: [], snap: null };
       function scanLink() {
         var base = (state.settings.qrUrl || '').trim();
         if (!scan.pin || !base || !fbReady()) return '';
@@ -15712,7 +15715,11 @@ function openFirebaseModal() {
         var deg = Math.atan2(uy, ux) * 180 / Math.PI;
         var rot = Math.round((deg + 90) / 90);
         rot = ((rot % 4) + 4) % 4;
-        return ['A', 'B', 'C', 'D'][rot];
+        var letter = ['A', 'B', 'C', 'D'][rot];
+        /* Camera truoc thuong lat guong (trai-phai dao nhau): B va D doi cho.
+           Bat 'Guong' khi thay B doc thanh D (hoac nguoc lai). */
+        if (typeof scan !== 'undefined' && scan.mirror && (letter === 'B' || letter === 'D')) letter = (letter === 'B') ? 'D' : 'B';
+        return letter;
       }
       /* Cat vung quanh ma QR tu khung hinh camera roi chay jsQR de lay huong xoay that.
          jsQR tra location theo huong cua ma (cum tim), khac voi cornerPoints cua
@@ -15886,7 +15893,9 @@ function openFirebaseModal() {
         else { inp.select(); document.execCommand('copy'); toast('Đã sao chép link máy quét.'); }
       });
       $('btnScanCamera').addEventListener('click', function () { scanStartCamera(); });
-      $('btnScanFlip').addEventListener('click', function () { scan.facing = (scan.facing === 'environment' ? 'user' : 'environment'); if (scan.running) scanStartCamera(); });
+      function scanMirrorLabel() { var b = $('btnScanMirror'); if (b) b.textContent = '🪞 Gương: ' + (scan.mirror ? 'Bật' : 'Tắt'); }
+      $('btnScanFlip').addEventListener('click', function () { scan.facing = (scan.facing === 'environment' ? 'user' : 'environment'); scan.mirror = (scan.facing === 'user'); scanMirrorLabel(); if (scan.running) scanStartCamera(); });
+      $('btnScanMirror').addEventListener('click', function () { scan.mirror = !scan.mirror; scanMirrorLabel(); toast(scan.mirror ? '🪞 Đã bật gương — B và D đổi chỗ.' : '🪞 Đã tắt gương.'); });
       $('btnScanClear').addEventListener('click', function () {
         var upd = {}, has = false;
         Object.keys(scan.map).forEach(function (k) { upd['card_' + k] = { ansQ: -1, ans: null }; has = true; });
