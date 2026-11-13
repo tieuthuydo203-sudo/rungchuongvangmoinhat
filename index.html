@@ -1753,10 +1753,11 @@ Chấp nhận các biến thể: “Câu 1.” hoặc chỉ “1.” thay cho �
       <button class="btn gold" id="btnScanCamera">📷 Bật camera</button>
       <button class="btn" id="btnScanFlip">🔄 Đổi camera</button>
       <button class="btn" id="btnScanMirror">🪞 Gương: Tắt</button>
+      <button class="btn gold" id="btnScanCalib">🎯 Căn chỉnh (1 lần)</button>
       <button class="btn" id="btnScanClear">🧹 Xóa đáp án câu này</button>
       <button class="btn danger" id="btnScanClose">✕ Đóng máy quét</button>
     </div>
-    <div class="sub" id="scanHint">Giơ thẻ sao cho mã QR lọt vào khung hình. Xoay thẻ để chữ A, B, C hoặc D lên trên cùng — máy sẽ đọc đúng chữ đó. Quét lại cùng một thẻ để đổi đáp án. Thẻ đã quét hiện viền vàng; khi giáo viên chốt câu, đáp án đúng chuyển xanh, đáp án sai chuyển đỏ. Quét từ xa: dùng thẻ cỡ Rất to, hướng camera về phía lớp và giữ yên vài giây để máy bắt nhiều thẻ cùng lúc (trên Chrome/Edge); đủ sáng và thẻ không bị che sẽ nhạy hơn.</div>
+    <div class="sub" id="scanHint">Giơ thẻ sao cho ô vuông đen lớn lọt vào khung hình. Xoay thẻ để chữ A, B, C hoặc D lên trên cùng — máy sẽ đọc đúng chữ đó. Quét lại cùng một thẻ để đổi đáp án. Thẻ đã quét hiện viền vàng; khi giáo viên chốt câu, đáp án đúng chuyển xanh, đáp án sai chuyển đỏ. Quét từ xa: thẻ dùng ô vuông lớn kiểu Wayground nên bắt được từ bục giảng, hướng camera về phía lớp và giữ yên vài giây để máy bắt nhiều thẻ cùng lúc; đủ sáng và thẻ không bị che sẽ nhạy hơn.</div>
     <div id="scanList" class="scan-list"></div>
   </div>
   <div id="printArea"></div>
@@ -11878,6 +11879,282 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 });
     </script>
     <script>
+// RCV strong marker (Wayground-style): large simple high-contrast square marker.
+// 7x7 grid. Outer ring = black border. Inner 5x5: 4 corners = orientation
+// (exactly ONE white corner = canonical top-left = answer A), other 21 cells
+// encode the student number (1..100) in binary, row-major, skipping corners.
+// Rotation: white corner at inner TL->A, TR->B, BR->C, BL->D.
+// Draw + detect (threshold, connected components, quad corners, homography warp,
+// grid sample, decode). Self-contained; no external deps.
+(function () {
+  var N = 7; // grid size
+  // Data cell order (inner 5x5, row-major, skipping the 4 inner corners).
+  var DATA_CELLS = [];
+  for (var r = 1; r <= 5; r++) for (var c = 1; c <= 5; c++) {
+    if ((r === 1 || r === 5) && (c === 1 || c === 5)) continue;
+    DATA_CELLS.push([r, c]);
+  }
+  // Inner corner positions (in 7x7 coords).
+  var CORNERS = [[1, 1], [1, 5], [5, 5], [5, 1]]; // TL, TR, BR, BL
+
+  function markerGrid(num) {
+    // Returns 7x7 array of 0 (white) / 1 (black).
+    var g = [];
+    for (var r = 0; r < N; r++) { g.push([]); for (var c = 0; c < N; c++) g[r][c] = 0; }
+    // Border black.
+    for (var i = 0; i < N; i++) { g[0][i] = 1; g[N - 1][i] = 1; g[i][0] = 1; g[i][N - 1] = 1; }
+    // Inner corners: TL white, others black.
+    g[1][1] = 0; g[1][5] = 1; g[5][5] = 1; g[5][1] = 1;
+    // Data: 21 bits, MSB first.
+    var n = num | 0;
+    for (var k = 0; k < DATA_CELLS.length; k++) {
+      var bit = (n >> (DATA_CELLS.length - 1 - k)) & 1;
+      var cell = DATA_CELLS[k];
+      g[cell[0]][cell[1]] = bit;
+    }
+    return g;
+  }
+  function drawMarker(ctx, num, size) {
+    // Draw the marker into ctx, filling a size x size square at (0,0).
+    var g = markerGrid(num);
+    var cell = size / N;
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = '#000000';
+    for (var r = 0; r < N; r++) for (var c = 0; c < N; c++) {
+      if (g[r][c]) ctx.fillRect(Math.round(c * cell), Math.round(r * cell), Math.ceil(cell), Math.ceil(cell));
+    }
+  }
+  // --- detection ---
+  function solveHomography(src, dst) {
+    // src, dst: arrays of 4 [x,y]. Returns 3x3 matrix mapping src -> dst.
+    // Solves via Gaussian elimination on the 8x8 DLT system.
+    var A = [], b = [];
+    for (var i = 0; i < 4; i++) {
+      var x = src[i][0], y = src[i][1], X = dst[i][0], Y = dst[i][1];
+      A.push([x, y, 1, 0, 0, 0, -X * x, -X * y]); b.push(X);
+      A.push([0, 0, 0, x, y, 1, -Y * x, -Y * y]); b.push(Y);
+    }
+    // Gaussian elimination with partial pivoting.
+    var n = 8;
+    for (var col = 0; col < n; col++) {
+      var piv = col;
+      for (var row = col + 1; row < n; row++) if (Math.abs(A[row][col]) > Math.abs(A[piv][col])) piv = row;
+      var tmp = A[col]; A[col] = A[piv]; A[piv] = tmp;
+      var tb = b[col]; b[col] = b[piv]; b[piv] = tb;
+      if (Math.abs(A[col][col]) < 1e-12) return null;
+      for (var row2 = col + 1; row2 < n; row2++) {
+        var f = A[row2][col] / A[col][col];
+        for (var k = col; k < n; k++) A[row2][k] -= f * A[col][k];
+        b[row2] -= f * b[col];
+      }
+    }
+    var h = new Array(9); h[8] = 1;
+    for (var row3 = n - 1; row3 >= 0; row3--) {
+      var s = b[row3];
+      for (var k = row3 + 1; k < n; k++) s -= A[row3][k] * h[k];
+      h[row3] = s / A[row3][row3];
+    }
+    return h;
+  }
+  function applyHomography(h, x, y) {
+    var w = h[6] * x + h[7] * y + h[8];
+    if (Math.abs(w) < 1e-12) return null;
+    return [(h[0] * x + h[1] * y + h[2]) / w, (h[3] * x + h[4] * y + h[5]) / w];
+  }
+  function orderCorners(pts) {
+    // pts: 4 [x,y]. Returns [TL, TR, BR, BL] in image coords.
+    var cx = 0, cy = 0;
+    pts.forEach(function (p) { cx += p[0]; cy += p[1]; });
+    cx /= 4; cy /= 4;
+    var out = [null, null, null, null];
+    pts.forEach(function (p) {
+      var dx = p[0] - cx, dy = p[1] - cy;
+      if (dx <= 0 && dy <= 0) out[0] = p;       // TL
+      else if (dx > 0 && dy <= 0) out[1] = p;   // TR
+      else if (dx > 0 && dy > 0) out[2] = p;    // BR
+      else out[3] = p;                          // BL
+    });
+    if (out.some(function (o) { return !o; })) return null;
+    return out;
+  }
+  function convexHull(points) {
+    // Monotonic chain. Returns hull points CCW (without duplicate last point).
+    if (points.length < 3) return points.slice();
+    var pts = points.slice().sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; });
+    function cross(o, a, b) { return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]); }
+    var lower = [];
+    pts.forEach(function (p) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop(); lower.push(p); });
+    var upper = [];
+    for (var i = pts.length - 1; i >= 0; i--) { var p2 = pts[i]; while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p2) <= 0) upper.pop(); upper.push(p2); }
+    lower.pop(); upper.pop();
+    return lower.concat(upper);
+  }
+  function approxQuad(hull) {
+    // Reduce a convex hull to 4 corners: pick the 4 hull points that maximize
+    // the quadrilateral area (try all combinations for small hulls).
+    if (hull.length < 4) return null;
+    if (hull.length === 4) return hull.slice();
+    var best = null, bestArea = -1;
+    function area(q) {
+      var s = 0;
+      for (var i = 0; i < 4; i++) { var a = q[i], b = q[(i + 1) % 4]; s += a[0] * b[1] - b[0] * a[1]; }
+      return Math.abs(s) / 2;
+    }
+    // Try combinations of 4 hull points (hull is small for a clean marker).
+    var m = hull.length;
+    if (m > 24) {
+      // Subsample to keep it fast.
+      var step = Math.floor(m / 24) || 1, sub = [];
+      for (var i = 0; i < m; i += step) sub.push(hull[i]);
+      hull = sub; m = hull.length;
+    }
+    for (var a = 0; a < m; a++) for (var b = a + 1; b < m; b++) for (var c = b + 1; c < m; c++) for (var d = c + 1; d < m; d++) {
+      var q = [hull[a], hull[b], hull[c], hull[d]];
+      // Order them around the centroid.
+      var cx = (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4, cy = (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4;
+      q.sort(function (p, r) { return Math.atan2(p[1] - cy, p[0] - cx) - Math.atan2(r[1] - cy, r[0] - cx); });
+      var ar = area(q);
+      if (ar > bestArea) { bestArea = ar; best = q; }
+    }
+    return best;
+  }
+  function sampleGrid(bin, W, H, corners) {
+    // Warp the quad (corners ordered TL,TR,BR,BL) to a canonical square and
+    // sample the 7x7 grid. Returns the 7x7 array of 0/1, or null.
+    var S = 140; // canonical size
+    var dst = [[0, 0], [S, 0], [S, S], [0, S]];
+    var h = solveHomography(corners, dst);
+    if (!h) return null;
+    var hinv = solveHomography(dst, corners);
+    if (!hinv) return null;
+    var g = [];
+    var cell = S / N;
+    for (var r = 0; r < N; r++) {
+      g.push([]);
+      for (var c = 0; c < N; c++) {
+        var cx = (c + 0.5) * cell, cy = (r + 0.5) * cell;
+        var p = applyHomography(hinv, cx, cy);
+        if (!p) { g[r][c] = 0; continue; }
+        var x = Math.round(p[0]), y = Math.round(p[1]);
+        if (x < 0 || x >= W || y < 0 || y >= H) { g[r][c] = 0; continue; }
+        g[r][c] = bin[y * W + x] ? 1 : 0;
+      }
+    }
+    return g;
+  }
+  function decodeGrid(g) {
+    // Returns {num, rot} or null. rot: 0=A,1=B,2=C,3=D (white inner corner position).
+    if (!g) return null;
+    // Border must be all black (allow 1 error).
+    var borderBad = 0;
+    for (var i = 0; i < N; i++) {
+      if (!g[0][i]) borderBad++;
+      if (!g[N - 1][i]) borderBad++;
+      if (!g[i][0]) borderBad++;
+      if (!g[i][N - 1]) borderBad++;
+    }
+    if (borderBad > 2) return null;
+    // Inner corners: exactly one white.
+    var vals = CORNERS.map(function (cc) { return g[cc[0]][cc[1]]; });
+    var whiteIdx = [];
+    for (var k = 0; k < 4; k++) if (!vals[k]) whiteIdx.push(k);
+    if (whiteIdx.length !== 1) return null;
+    var rot = whiteIdx[0];
+    // Rotate grid so the white corner is at TL, then read data bits.
+    function rotCell(r, c, rotTimes) {
+      // Rotate (r,c) within the inner 5x5 (offset by 1) rotTimes times CW.
+      var rr = r - 1, cc = c - 1;
+      for (var t = 0; t < rotTimes; t++) { var nr = cc, nc = 4 - rr; rr = nr; cc = nc; }
+      return [rr + 1, cc + 1];
+    }
+    var num = 0;
+    for (var k2 = 0; k2 < DATA_CELLS.length; k2++) {
+      var cell = DATA_CELLS[k2];
+      var rc = rotCell(cell[0], cell[1], rot);
+      var bit = g[rc[0]][rc[1]] ? 1 : 0;
+      num = (num << 1) | bit;
+    }
+    if (num < 1 || num > 100) return null;
+    return { num: num, rot: rot };
+  }
+  function detectMarkers(imgData, W, H, opts) {
+    // imgData: Uint8ClampedArray RGBA. Returns [{num, letter, box:{x,y,w,h}, corners}].
+    opts = opts || {};
+    var minArea = opts.minArea || 900; // min black-blob area in pixels
+    var thr = (opts.threshold != null) ? opts.threshold : 128;
+    // 1) Binarize (black=1).
+    var bin = new Uint8Array(W * H);
+    for (var i = 0; i < W * H; i++) {
+      var r = imgData[i * 4], g = imgData[i * 4 + 1], b = imgData[i * 4 + 2];
+      var lum = (r * 299 + g * 587 + b * 114) / 1000;
+      bin[i] = lum < thr ? 1 : 0;
+    }
+    // 2) Connected components (4-connectivity) via BFS on black pixels.
+    var label = new Int32Array(W * H).fill(-1);
+    var comps = [];
+    var stack = [];
+    var dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    for (var y = 0; y < H; y++) for (var x = 0; x < W; x++) {
+      var idx = y * W + x;
+      if (!bin[idx] || label[idx] !== -1) continue;
+      var id = comps.length;
+      var pts = [];
+      var minX = x, maxX = x, minY = y, maxY = y;
+      stack.length = 0; stack.push(idx); label[idx] = id;
+      while (stack.length) {
+        var cur = stack.pop();
+        var cx = cur % W, cy = (cur / W) | 0;
+        pts.push([cx, cy]);
+        if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy; if (cy > maxY) maxY = cy;
+        for (var d = 0; d < 4; d++) {
+          var nx = cx + dirs[d][0], ny = cy + dirs[d][1];
+          if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+          var ni = ny * W + nx;
+          if (bin[ni] && label[ni] === -1) { label[ni] = id; stack.push(ni); }
+        }
+      }
+      comps.push({ pts: pts, minX: minX, maxX: maxX, minY: minY, maxY: maxY });
+    }
+    var out = [];
+    var seen = {};
+    comps.forEach(function (comp) {
+      var area = comp.pts.length;
+      if (area < minArea) return;
+      var bw = comp.maxX - comp.minX + 1, bh = comp.maxY - comp.minY + 1;
+      if (bw < 24 || bh < 24) return;
+      var aspect = bw / bh;
+      if (aspect < 0.55 || aspect > 1.8) return;
+      // The marker border is a black ring; the whole black component includes
+      // the border + black interior cells (they touch). Use the hull quad.
+      var hull = convexHull(comp.pts);
+      var quad = approxQuad(hull);
+      if (!quad) return;
+      var corners = orderCorners(quad);
+      if (!corners) return;
+      var g = sampleGrid(bin, W, H, corners);
+      var dec = decodeGrid(g);
+      if (!dec) return;
+      var key = dec.num;
+      if (seen[key]) return;
+      seen[key] = true;
+      out.push({
+        num: dec.num, letter: ['A', 'B', 'C', 'D'][dec.rot],
+        box: { x: comp.minX, y: comp.minY, w: bw, h: bh },
+        corners: corners
+      });
+    });
+    return out;
+  }
+  // Export for Node test and for the browser (window.__rcvMarker).
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { markerGrid: markerGrid, drawMarker: drawMarker, detectMarkers: detectMarkers, decodeGrid: decodeGrid };
+  }
+  if (typeof window !== 'undefined') window.__rcvMarker = { markerGrid: markerGrid, drawMarker: drawMarker, detectMarkers: detectMarkers, decodeGrid: decodeGrid };
+})();
+
+    </script>
+    <script>
     (function () {
       'use strict';
       /* ================= Dữ liệu mặc định ================= */
@@ -15640,7 +15917,7 @@ function openFirebaseModal() {
         var html = '<div class="print-head">' + head + '</div><div class="print-grid ' + cardPrintSize() + '">';
         for (var i = 0; i < count; i++) {
           var nameHtml = generic ? 'Thẻ chung' : esc(state.students[i]);
-          html += '<div class="qrcard"><div class="qrcard-head"><span class="av">' + avatarFor(i, 44) + '</span><span class="qrcard-num">Số ' + (i + 1) + '</span></div><div class="qrcard-name">' + nameHtml + '</div><div class="qrcard-qr"><span class="qrcard-letter top">A</span><span class="qrcard-letter right">B</span><span class="qrcard-letter bottom">C</span><span class="qrcard-letter left">D</span><canvas class="qrcanvas" width="220" height="220" data-qr="RCVQR:' + (i + 1) + '"></canvas></div></div>';
+          html += '<div class="qrcard"><div class="qrcard-head"><span class="av">' + avatarFor(i, 44) + '</span><span class="qrcard-num">Số ' + (i + 1) + '</span></div><div class="qrcard-name">' + nameHtml + '</div><div class="qrcard-qr"><span class="qrcard-letter top">A</span><span class="qrcard-letter right">B</span><span class="qrcard-letter bottom">C</span><span class="qrcard-letter left">D</span><canvas class="qrcanvas" width="280" height="280" data-marker="' + (i + 1) + '"></canvas></div></div>';
         }
         html += '</div>';
         return html;
@@ -15648,7 +15925,11 @@ function openFirebaseModal() {
       function drawCardQRs(root) {
         if (!root) return;
         var cans = root.querySelectorAll('.qrcanvas');
-        cans.forEach(function (cv) { QRGen.draw(cv, cv.getAttribute('data-qr')); });
+        cans.forEach(function (cv) {
+          var mk = cv.getAttribute('data-marker');
+          if (mk && window.__rcvMarker) { var ctx = cv.getContext('2d'); if (ctx) window.__rcvMarker.drawMarker(ctx, Number(mk), cv.width); return; }
+          QRGen.draw(cv, cv.getAttribute('data-qr'));
+        });
       }
       function buildPrintCards() {
         var gf = $('genericCountField'); if (gf) gf.style.display = (cardPrintMode() === 'generic') ? '' : 'none';
@@ -15657,7 +15938,8 @@ function openFirebaseModal() {
         var prev = $('cardPreview'); if (prev) { prev.innerHTML = html; drawCardQRs(prev); }
       }
       /* Máy quét thẻ QR (mở bằng link #scan=<PIN>&cfg=... trên điện thoại cầm tay) */
-      var scan = { pin: null, stop: null, stream: null, canvas: null, facing: 'environment', mirror: false, running: false, raf: 0, map: {}, current: -1, roster: [], snap: null };
+      var scan = { pin: null, stop: null, stream: null, canvas: null, facing: 'environment', mirror: false, calOffset: 0, calibrating: false, running: false, raf: 0, map: {}, current: -1, roster: [], snap: null };
+      try { var _co = parseInt(localStorage.getItem('rcv_scan_cal_v1') || '0', 10); if (_co >= 0 && _co <= 3) scan.calOffset = _co; } catch (e) {}
       function scanLink() {
         var base = (state.settings.qrUrl || '').trim();
         if (!scan.pin || !base || !fbReady()) return '';
@@ -15715,6 +15997,9 @@ function openFirebaseModal() {
         var deg = Math.atan2(uy, ux) * 180 / Math.PI;
         var rot = Math.round((deg + 90) / 90);
         rot = ((rot % 4) + 4) % 4;
+        /* Can chinh 1 lan: may cua giao vien co the xoay anh 180 do (B doc thanh D).
+           calOffset la do xoay cua may, tru no di de ra dap an that. */
+        if (typeof scan !== 'undefined' && scan.calOffset) rot = ((rot - scan.calOffset) % 4 + 4) % 4;
         var letter = ['A', 'B', 'C', 'D'][rot];
         /* Camera truoc thuong lat guong (trai-phai dao nhau): B va D doi cho.
            Bat 'Guong' khi thay B doc thanh D (hoac nguoc lai). */
@@ -15779,6 +16064,20 @@ function openFirebaseModal() {
         layer.innerHTML = html;
       }
       function scanApplyDetections(list) {
+        /* Can chinh: giao vien dang gio the co chu A o tren. Chu cai doc duoc cho biet
+           do xoay cua may; luu lai roi ap dung cho moi lan quet sau. Khong ghi dap an nay. */
+        if (scan.calibrating) {
+          var cal = null;
+          for (var ci = 0; ci < list.length; ci++) { if (list[ci].letter) { cal = list[ci].letter; break; } }
+          if (cal) {
+            scan.calOffset = (('ABCD'.indexOf(cal) % 4) + 4) % 4;
+            try { localStorage.setItem('rcv_scan_cal_v1', String(scan.calOffset)); } catch (e) {}
+            scan.calibrating = false;
+            toast('🎯 Đã căn chỉnh xong — từ giờ quét đúng hướng thẻ của bạn.');
+            scanOverlay(list);
+          } else scanOverlay(list);
+          return;
+        }
         var changed = false, upd = {};
         list.forEach(function (it) {
           if (it.idx >= 0 && it.idx < scan.roster.length && it.letter && scan.map[it.idx] !== it.letter) {
@@ -15792,10 +16091,42 @@ function openFirebaseModal() {
         }
         scanOverlay(list);
       }
+      /* Quet the manh kieu Wayground: tim o vuong den lon (7x7), doc so hoc sinh
+         + huong xoay (A/B/C/D). Dac diem lon nen bat duoc tu xa, khong can giai ma QR day dac.
+         Ap dung calOffset (can chinh) cho huong xoay. */
+      function scanDetectMarkers(video) {
+        var Mk = window.__rcvMarker; if (!Mk) return [];
+        var now = Date.now();
+        if (scan.markerLast && now - scan.markerLast < 150) return scan.markerCache || [];
+        scan.markerLast = now;
+        var cv = scan.markerCanvas; if (!cv) { cv = document.createElement('canvas'); scan.markerCanvas = cv; }
+        var w = video.videoWidth, h = video.videoHeight;
+        if (!w || !h) return [];
+        var scale = Math.min(1, 640 / w);
+        cv.width = Math.max(160, Math.round(w * scale)); cv.height = Math.max(120, Math.round(h * scale));
+        var ctx = cv.getContext('2d'); if (!ctx) return [];
+        try {
+          ctx.drawImage(video, 0, 0, cv.width, cv.height);
+          var img = ctx.getImageData(0, 0, cv.width, cv.height);
+          var found = Mk.detectMarkers(img.data, cv.width, cv.height, { minArea: 400 });
+          var out = [];
+          found.forEach(function (f) {
+            var rot = 'ABCD'.indexOf(f.letter);
+            if (scan.calOffset) rot = ((rot - scan.calOffset) % 4 + 4) % 4;
+            var letter = ['A', 'B', 'C', 'D'][rot];
+            if (scan.mirror && (letter === 'B' || letter === 'D')) letter = (letter === 'B') ? 'D' : 'B';
+            out.push({ idx: f.num - 1, letter: letter, box: { x: f.box.x / scale, y: f.box.y / scale, w: f.box.w / scale, h: f.box.h / scale } });
+          });
+          scan.markerCache = out;
+          return out;
+        } catch (e) { return []; }
+      }
       function scanFrame() {
         if (!scan.running) return;
         var video = $('scanVideo');
         if (video && video.readyState === video.HAVE_ENOUGH_DATA) {
+          var mkList = scanDetectMarkers(video);
+          if (mkList.length) { scanApplyDetections(mkList); scan.raf = requestAnimationFrame(scanFrame); return; }
           var det = scanDetector();
           if (det && !scan.detectBusy) {
             scan.detectBusy = true;
@@ -15896,6 +16227,10 @@ function openFirebaseModal() {
       function scanMirrorLabel() { var b = $('btnScanMirror'); if (b) b.textContent = '🪞 Gương: ' + (scan.mirror ? 'Bật' : 'Tắt'); }
       $('btnScanFlip').addEventListener('click', function () { scan.facing = (scan.facing === 'environment' ? 'user' : 'environment'); scan.mirror = (scan.facing === 'user'); scanMirrorLabel(); if (scan.running) scanStartCamera(); });
       $('btnScanMirror').addEventListener('click', function () { scan.mirror = !scan.mirror; scanMirrorLabel(); toast(scan.mirror ? '🪞 Đã bật gương — B và D đổi chỗ.' : '🪞 Đã tắt gương.'); });
+      $('btnScanCalib').addEventListener('click', function () {
+        scan.calOffset = 0; scan.calibrating = true;
+        toast('🎯 Căn chỉnh: giơ 1 thẻ bất kỳ, xoay chữ A lên trên, giữ yên 2 giây — máy sẽ tự học hướng quét của bạn.');
+      });
       $('btnScanClear').addEventListener('click', function () {
         var upd = {}, has = false;
         Object.keys(scan.map).forEach(function (k) { upd['card_' + k] = { ansQ: -1, ans: null }; has = true; });
